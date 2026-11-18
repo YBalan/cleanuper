@@ -16,6 +16,7 @@
                installer caches). Review the list before using.
 
   Categories flagged ExplicitOnly are never part of a level; select them with -Only.
+  Categories flagged ReportOnly (nuget-packages) are scanned and shown but can never be deleted by this tool.
 
 .EXAMPLE
   .\Cleanuper.ps1                       # dry run, Safe level
@@ -23,7 +24,7 @@
   .\Cleanuper.ps1 -Apply                # delete Safe items (asks to confirm)
   .\Cleanuper.ps1 -Apply -Elevate       # same, plus admin-only items (UAC prompt)
   .\Cleanuper.ps1 -Only 'docker-*' -Apply
-  .\Cleanuper.ps1 -Level Moderate -Skip nuget-packages -Apply
+  .\Cleanuper.ps1 -Level Moderate -Skip recycle-bin -Apply
   .\Cleanuper.ps1 -List                 # show every category
   .\Cleanuper.ps1 -Hogs                 # biggest folders in AppData (report only)
 #>
@@ -39,6 +40,7 @@ param(
   [switch]$List,              # list categories and exit
   [switch]$Hogs,              # report largest folders and exit
   [switch]$CompactVhdx,       # after Docker prune: shrink Docker's WSL2 disk (admin)
+  [switch]$CompactOnly,       # ONLY shrink Docker's WSL2 disk (no category cleanup); dry run unless -Apply
   [switch]$Yes,               # skip the confirmation prompt
   [switch]$Elevate,           # relaunch as administrator
   [switch]$PauseAtEnd
@@ -128,7 +130,7 @@ function Test-SafeTarget([string]$Path) {
     "$env:USERPROFILE\Videos", "$env:USERPROFILE\OneDrive", "$env:USERPROFILE\source") | Where-Object { $_ }
   foreach ($d in $exact) { if ($full -ieq $d.TrimEnd('\')) { return $false } }
   $prefix = @("$env:WINDIR\System32", "$env:WINDIR\SysWOW64", "$env:WINDIR\WinSxS", "$env:WINDIR\Installer",
-    $env:ProgramFiles, $pf86, "$env:ProgramData\Package Cache") | Where-Object { $_ }
+    $env:ProgramFiles, $pf86, "$env:ProgramData\Package Cache", "$env:LOCALAPPDATA\Claude-Data") | Where-Object { $_ }
   foreach ($d in $prefix) {
     $d = $d.TrimEnd('\')
     if ($full -ieq $d -or $full.StartsWith($d + '\', [StringComparison]::OrdinalIgnoreCase)) { return $false }
@@ -266,9 +268,11 @@ function Get-Categories {
   $cats = New-Object System.Collections.ArrayList
   function Add-Cat {
     param([string]$Id, [string]$Group, [string]$Risk, [string]$Desc, [scriptblock]$Targets,
-      [switch]$Admin, [switch]$ExplicitOnly, [scriptblock]$Precheck, [scriptblock]$Estimate, [scriptblock]$Run)
+      [switch]$Admin, [switch]$ExplicitOnly, [switch]$ReportOnly, [string]$Hint,
+      [scriptblock]$Precheck, [scriptblock]$Estimate, [scriptblock]$Run)
     [void]$cats.Add([pscustomobject]@{ Id = $Id; Group = $Group; Risk = $Risk; Desc = $Desc; Targets = $Targets
-        Admin = [bool]$Admin; ExplicitOnly = [bool]$ExplicitOnly; Precheck = $Precheck; Estimate = $Estimate; Run = $Run })
+        Admin = [bool]$Admin; ExplicitOnly = [bool]$ExplicitOnly; ReportOnly = [bool]$ReportOnly; Hint = $Hint
+        Precheck = $Precheck; Estimate = $Estimate; Run = $Run })
   }
 
   # ---- Windows
@@ -375,13 +379,9 @@ function Get-Categories {
     Tgt "$gUser\.claude\file-history" -Age $gHist }
   Add-Cat 'claude-code-transcripts' 'Claude' Aggressive 'Claude Code session transcripts older than -HistoryDays (loses --resume; memory/ folders are kept)' {
     Tgt "$gUser\.claude\projects" -Age $gHist -Keep 'memory' }
-  Add-Cat 'claude-desktop-caches' 'Claude' Safe 'Claude Desktop browser/GPU caches' {
-    foreach ($base in @(@(Get-ChildItem "$gLocal\Claude-Data" -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object FullName) + "$gRoam\Claude")) {
-      foreach ($s in 'Cache', 'Code Cache', 'GPUCache', 'GrShaderCache', 'DawnCache', 'Service Worker\CacheStorage') { Tgt "$base\$s" } } }
-  Add-Cat 'claude-desktop-runtime' 'Claude' Aggressive 'Claude Desktop bundled claude-code / claude-code-vm copies (re-downloaded by the app)' {
-    foreach ($n in 'claude-code', 'claude-code-vm') { TgtGlob "$gLocal\Claude-Data\*\$n" } }
-  Add-Cat 'claude-desktop-vm' 'Claude' Aggressive 'Claude Desktop VM bundle (vm_bundles). Can hold Cowork session files - EXPLICIT ONLY' -ExplicitOnly {
-    TgtGlob "$gLocal\Claude-Data\*\vm_bundles" }
+  # Claude Desktop's %LOCALAPPDATA%\Claude-Data is deliberately NOT cleaned: its own README says not to delete,
+  # move or rename anything in it (it holds settings, sign-in and Cowork tasks/files). Use the app's
+  # Settings > This computer > System > Storage instead. Test-SafeTarget refuses that folder as well.
 
   # ---- GitHub Copilot
   Add-Cat 'copilot-cache' 'Copilot' Safe 'Copilot CLI staged updater + logs (older than -MinAgeHours)' {
@@ -391,10 +391,20 @@ function Get-Categories {
   Add-Cat 'copilot-sessions' 'Copilot' Aggressive 'Copilot CLI session history older than -HistoryDays' {
     Tgt "$gUser\.copilot\session-state" -Age $gHist }
 
+  # ---- CapCut (only the app's old versions and its regenerable cache; Projects/drafts are never touched)
+  $ccBlock = { if (Test-Running 'CapCut') { 'CapCut is running (close it)' } }
+  Add-Cat 'capcut-old-versions' 'CapCut' Moderate 'Superseded CapCut app versions in Apps\<version> (the newest 2 are kept)' -Precheck $ccBlock {
+    $vers = Get-ChildItem "$gLocal\CapCut\Apps" -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d+(\.\d+){2,3}$' } |
+      ForEach-Object { [pscustomobject]@{ Dir = $_; Ver = [version]$_.Name } } | Sort-Object Ver
+    if ($vers.Count -gt 2) { foreach ($v in $vers | Select-Object -First ($vers.Count - 2)) { Tgt $v.Dir.FullName -Self } } }
+  Add-Cat 'capcut-cache' 'CapCut' Moderate 'CapCut User Data\Cache (rebuilt when projects are reopened; Projects/drafts untouched)' -Precheck $ccBlock {
+    Tgt "$gLocal\CapCut\User Data\Cache" }
+
   # ---- package caches
   Add-Cat 'nuget-cache' 'Packages' Safe 'NuGet HTTP + plugin caches' {
     Tgt "$gLocal\NuGet\v3-cache"; Tgt "$gLocal\NuGet\plugins-cache"; Tgt "$gLocal\NuGet\Cache" }
-  Add-Cat 'nuget-packages' 'Packages' Moderate 'NuGet global packages folder (restored again on next build)' { Tgt $gNuget }
+  Add-Cat 'nuget-packages' 'Packages' Moderate 'NuGet global packages folder - REPORT ONLY, never deleted by this tool' -ReportOnly `
+    -Hint 'to free C: without deleting, move it to another drive: launchers\move-nuget-to-D.cmd' { Tgt $gNuget }
   Add-Cat 'node-caches' 'Packages' Safe 'npm and Yarn download caches' {
     Tgt "$gLocal\npm-cache\_cacache"; Tgt "$gLocal\npm-cache\_logs"; Tgt "$gLocal\Yarn\Cache" }
   Add-Cat 'python-caches' 'Packages' Safe 'pip and uv download caches' { Tgt "$gLocal\pip\Cache"; Tgt "$gLocal\uv\cache" }
@@ -408,6 +418,7 @@ function Get-Categories {
 function Invoke-Category {
   param($Cat, [bool]$Delete)
   $r = [pscustomobject]@{ Bytes = [int64]0; Files = 0; Locked = 0; Young = 0; Errors = @(); Unknown = $false }
+  if ($Delete -and $Cat.ReportOnly) { return $r }   # hard stop: report-only categories have no delete path
   if ($Cat.Run) {
     if ($Delete) { $v = & $Cat.Run } else { $v = & $Cat.Estimate }
     $v = @($v)[-1]
@@ -426,11 +437,37 @@ function Invoke-Category {
   $r
 }
 
+# Docker Desktop may keep its WSL2 disks on another drive (Settings > Resources > Disk image location),
+# so locate them through the WSL registration instead of assuming %LOCALAPPDATA%.
+function Get-DockerDataDrive {
+  if ($null -eq $script:DockerDataDrive) {
+    $script:DockerDataDrive = ''
+    Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss' -ErrorAction SilentlyContinue | ForEach-Object {
+      $k = Get-ItemProperty $_.PSPath
+      if ($k.DistributionName -eq 'docker-desktop-data' -and $k.BasePath -match '([A-Za-z]):') { $script:DockerDataDrive = $Matches[1].ToUpper() }
+    }
+  }
+  $script:DockerDataDrive
+}
+function Get-DockerDiskFiles {
+  $dirs = @("$env:LOCALAPPDATA\Docker")
+  Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss' -ErrorAction SilentlyContinue | ForEach-Object {
+    $k = Get-ItemProperty $_.PSPath
+    if ($k.DistributionName -like 'docker-desktop*' -and $k.BasePath) { $dirs += ($k.BasePath -replace '^\\\\\?\\', '') }
+  }
+  $dirs | Select-Object -Unique | Where-Object { -not (Test-UnderOneDrive $_) -and (Test-Path -LiteralPath $_) } |
+    ForEach-Object { Get-ChildItem -LiteralPath $_ -Recurse -Filter *.vhdx -Force -ErrorAction SilentlyContinue } |
+    Sort-Object FullName -Unique
+}
 function Invoke-CompactVhdx {
   param([bool]$Delete)
-  $files = @(Get-ChildItem "$env:LOCALAPPDATA\Docker" -Recurse -Filter *.vhdx -Force -ErrorAction SilentlyContinue)
+  $files = @(Get-DockerDiskFiles)
   if (-not $files) { Write-Host '  No Docker WSL2 disks found.'; return }
-  foreach ($f in $files) { Write-Host ('  {0}  ({1})' -f $f.FullName, (Format-Size $f.Length)) }
+  foreach ($f in $files) {
+    $dl = $f.FullName.Substring(0, 1).ToUpper()
+    Write-Host ('  {0}  ({1})' -f $f.FullName, (Format-Size $f.Length))
+    if ($dl -ne 'C') { Write-Host ("    note: this disk is on drive ${dl}: - compacting frees space on ${dl}:, not on C:") -ForegroundColor DarkYellow }
+  }
   if (-not $Delete) { Write-Host '  (dry run: would run "wsl --shutdown" and compact the disks above)'; return }
   if (-not (Test-IsAdmin)) { Write-Host '  Compaction needs an elevated shell (use -Elevate).' -ForegroundColor Yellow; return }
   if (Get-Process -Name 'Docker Desktop' -ErrorAction SilentlyContinue) {
@@ -467,6 +504,7 @@ function Show-Hogs {
     'C:\Windows\WinSxS             - use the win-component-cleanup category (DISM), never delete by hand',
     '~\.android\avd                - your emulator images (use android-avd-snapshots for the cache part)',
     '%LOCALAPPDATA%\Arduino15\packages, ~\.platformio\packages - installed toolchains',
+    '%LOCALAPPDATA%\Claude-Data    - Claude Desktop: its README says do not delete/move; use Claude > Settings > This computer > System > Storage',
     'Your OneDrive folder           - never read, scanned or modified by this tool',
     'App data of CapCut, Teams, WhatsApp, Office, Autodesk ... - clean via each app''s own settings') |
     ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
@@ -502,7 +540,7 @@ $all = Get-Categories
 
 if ($List) {
   $all | Sort-Object Group, @{ e = { $Risk[$_.Risk] } }, Id | ForEach-Object {
-    $flags = @(); if ($_.Admin) { $flags += 'admin' }; if ($_.ExplicitOnly) { $flags += 'explicit-only' }
+    $flags = @(); if ($_.Admin) { $flags += 'admin' }; if ($_.ExplicitOnly) { $flags += 'explicit-only' }; if ($_.ReportOnly) { $flags += 'report-only' }
     $c = switch ($_.Risk) { 'Safe' { 'Green' } 'Moderate' { 'Yellow' } default { 'Red' } }
     Write-Host ('{0,-28} ' -f $_.Id) -NoNewline
     Write-Host ('{0,-10} ' -f $_.Risk) -NoNewline -ForegroundColor $c
@@ -511,11 +549,29 @@ if ($List) {
   return
 }
 if ($Hogs) { Show-Hogs; return }
+if ($CompactOnly) {
+  Write-Host ("`nDocker WSL2 disk compaction  [{0}]" -f $(if ($Apply) { 'APPLY' } else { 'DRY RUN' })) -ForegroundColor Cyan
+  if ($Apply -and -not $Yes) {
+    $ans = Read-Host 'This runs "wsl --shutdown" (stops Docker and every WSL distro). Continue? [y/N]'
+    if ($ans -notmatch '^(y|yes)$') { Write-Host 'Aborted.'; if ($PauseAtEnd) { Read-Host 'Press Enter to close' | Out-Null }; return }
+  }
+  Invoke-CompactVhdx -Delete ([bool]$Apply)
+  if (-not $Apply) { Write-Host "`nDry run only - re-run with -Apply to compact." -ForegroundColor Cyan }
+  if ($PauseAtEnd) { Read-Host 'Press Enter to close' | Out-Null }
+  return
+}
 
 # select categories
 if ($Only.Count) {
-  $sel = @($all | Where-Object { $id = $_.Id; [bool]($Only | Where-Object { $id -like $_ }) })
-  foreach ($o in $Only) { if (-not ($all | Where-Object { $_.Id -like $o })) { Write-Host "Unknown category: $o (see -List)" -ForegroundColor Red; exit 2 } }
+  # Wildcards never select ExplicitOnly categories (e.g. docker-volumes); those need their exact id.
+  $sel = @($all | Where-Object {
+      $c = $_; $hit = $false
+      foreach ($o in $Only) { if ($c.Id -eq $o -or (-not $c.ExplicitOnly -and $c.Id -like $o)) { $hit = $true } }
+      $hit })
+  foreach ($o in $Only) {
+    if (-not ($all | Where-Object { $_.Id -eq $o -or (-not $_.ExplicitOnly -and $_.Id -like $o) })) {
+      Write-Host "Unknown category: $o (see -List; explicit-only ones need their exact id)" -ForegroundColor Red; exit 2 }
+  }
 }
 else { $sel = @($all | Where-Object { $Risk[$_.Risk] -le $Risk[$Level] -and -not $_.ExplicitOnly }) }
 if ($Skip.Count) { $sel = @($sel | Where-Object { $id = $_.Id; -not ($Skip | Where-Object { $id -like $_ }) }) }
@@ -542,6 +598,11 @@ $plan = foreach ($c in $sel) {
 }
 
 function Show-Plan($rows, [bool]$After) {
+  # Largest first; then categories whose size is unknown (n/a); skipped categories last.
+  $rows = @($rows | Sort-Object `
+    @{ Expression = { if ($_.Reason) { 2 } elseif ($_.Res.Unknown) { 1 } else { 0 } } },
+    @{ Expression = { if ($_.Res) { - $_.Res.Bytes } else { 0 } } },
+    @{ Expression = { $_.Cat.Id } })
   Write-Host ''
   Write-Host ('{0,-28} {1,-10} {2,12} {3,8}  {4}' -f 'CATEGORY', 'RISK', $(if ($After) { 'FREED' } else { 'RECLAIMABLE' }), 'FILES', 'NOTE') -ForegroundColor White
   foreach ($row in $rows) {
@@ -552,15 +613,29 @@ function Show-Plan($rows, [bool]$After) {
     $sz = if ($row.Res.Unknown) { 'n/a' } else { Format-Size $row.Res.Bytes }
     $note = @(); if ($row.Res.Young) { $note += "$($row.Res.Young) too new, kept" }; if ($row.Res.Locked) { $note += "$($row.Res.Locked) locked/skipped" }
     if ($row.Res.Errors.Count) { $note += "$($row.Res.Errors.Count) warning(s)" }
+    if ($c.Estimate -and -not $After -and -not $row.Res.Unknown) { $note += 'estimate' }
+    if ($c.ReportOnly) { $note += 'REPORT ONLY - never deleted' }
+    if ($c.Id -like 'docker-*') { $dd = Get-DockerDataDrive; if ($dd -and $dd -ne 'C') { $note += "frees drive ${dd}:, not C:" } }
     Write-Host ('{0,12} {1,8}  {2}' -f $sz, $row.Res.Files, ($note -join '; '))
   }
 }
 
 Show-Plan $plan $false
-$runnable = @($plan | Where-Object { -not $_.Reason })
+$scanned = @($plan | Where-Object { -not $_.Reason })
+$runnable = @($scanned | Where-Object { -not $_.Cat.ReportOnly })     # what -Apply may delete
+$reportOnly = @($scanned | Where-Object { $_.Cat.ReportOnly })        # shown, never deleted
 $total = ($runnable | ForEach-Object { $_.Res.Bytes } | Measure-Object -Sum).Sum
 Write-Host ('{0}' -f ('-' * 70))
 Write-Host ('Total reclaimable (estimate): {0}' -f (Format-Size $total)) -ForegroundColor Cyan
+foreach ($ro in $reportOnly) {
+  Write-Host ('Report only, NOT included and never deleted: {0} {1}' -f $ro.Cat.Id, (Format-Size $ro.Res.Bytes)) -ForegroundColor Yellow
+  if ($ro.Cat.Hint) { Write-Host ('  hint: {0}' -f $ro.Cat.Hint) -ForegroundColor DarkGray }
+}
+$dockerDrive = Get-DockerDataDrive
+if ($dockerDrive -and $dockerDrive -ne 'C') {
+  $offC = ($runnable | Where-Object { $_.Cat.Id -like 'docker-*' } | ForEach-Object { $_.Res.Bytes } | Measure-Object -Sum).Sum
+  if ($offC) { Write-Host ('  of which {0} is on drive {1}: (Docker data disk) and will NOT free space on C:' -f (Format-Size $offC), $dockerDrive) -ForegroundColor Yellow }
+}
 foreach ($row in $runnable) { foreach ($e in $row.Res.Errors) { if ($e -like 'REFUSED*' -or $e -like 'skipped*') { Write-Host "  ! $($row.Cat.Id): $e" -ForegroundColor Red } } }
 
 if ($CompactVhdx) { Write-Host "`nDocker WSL2 disk compaction:" -ForegroundColor Cyan }
@@ -572,7 +647,7 @@ if (-not $Apply) {
   return
 }
 
-if (-not $runnable.Count) { Write-Host 'Nothing to do.'; if ($PauseAtEnd) { Read-Host 'Press Enter to close' | Out-Null }; return }
+if (-not $runnable.Count) { Write-Host $(if ($reportOnly.Count) { 'Nothing to delete (report-only categories are never deleted).' } else { 'Nothing to do.' }); if ($PauseAtEnd) { Read-Host 'Press Enter to close' | Out-Null }; return }
 if (-not $Yes) {
   $ans = Read-Host ("`nDelete about {0} across {1} categories? [y/N]" -f (Format-Size $total), $runnable.Count)
   if ($ans -notmatch '^(y|yes)$') { Write-Host 'Aborted.'; if ($PauseAtEnd) { Read-Host 'Press Enter to close' | Out-Null }; return }
